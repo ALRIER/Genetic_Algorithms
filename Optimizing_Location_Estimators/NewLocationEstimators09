@@ -260,7 +260,8 @@ write_manifest <- function(dir_out, meta, extra = NULL, write_session = TRUE) {
   
   if (isTRUE(write_session)) {
     sess_path <- file.path(dir_out, "SESSION.txt")
-    sink(sess_path); on.exit(sink(), add = TRUE)
+    sink(sess_path)
+    on.exit({ if (sink.number() > 0) sink() }, add = TRUE)
     cat("# sessionInfo()\n\n"); print(utils::sessionInfo()); cat("\n")
     pkgs <- tryCatch(installed.packages()[, c("Package","Version")], error = function(e) NULL)
     if (!is.null(pkgs)) {
@@ -1864,26 +1865,34 @@ run_all_one_shot <- function(
   
   # ---- Planificador de pasos para mostrar 1-100% --------------------------
   .plan_family_steps <- function(n_cfg) {
-    if (search_strategy != "halving") return(n_cfg)  # 1 eval por config
+    if (search_strategy != "halving") return(as.integer(n_cfg))  # 1 eval por config
+    
     # F1/F2 si hp_strict
     n1 <- if (isTRUE(hp_strict)) {
       if (!is.null(hp1_k)) min(hp1_k, n_cfg) else ceiling(n_cfg * hp1_frac)
-    } else 0L
+    } else 0
+    n1 <- as.integer(n1)
+    
     n2 <- if (isTRUE(hp_strict)) {
       if (!is.null(hp2_k)) min(hp2_k, n1) else ceiling(n1 * 0.33)
     } else n_cfg
+    n2 <- as.integer(n2)
+    
     start_halv <- if (isTRUE(hp_strict)) min(hp3_pool_k, n2) else n2
+    start_halv <- as.integer(start_halv)
+    
     S <- length(stage_gens_frac)
-    # Suma evaluaciones de cada stage de halving
     cur <- start_halv
     n_halv <- 0L
     for (s in seq_len(S)) {
-      n_halv <- n_halv + max(0L, cur)
-      cur <- if (s < S) max(1L, ceiling(cur / eta)) else finalists_per_family
+      n_halv <- n_halv + max(0L, as.integer(cur))
+      cur <- if (s < S) max(1L, as.integer(ceiling(cur / eta))) else as.integer(finalists_per_family)
     }
-    n_final <- finalists_per_family
-    n1 + n2 + n_halv + n_final
+    n_final <- as.integer(finalists_per_family)
+    
+    as.integer(n1 + n2 + n_halv + n_final)
   }
+  
   
   total_steps <- sum(vapply(families_to_run, function(fam) .plan_family_steps(nrow(cfg_grid)), integer(1)))
   progress_init(total_steps)
