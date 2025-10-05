@@ -267,10 +267,37 @@ write_manifest <- function(dir_out, meta, extra = NULL, write_session = TRUE) {
       cat("# installed.packages() snapshot (Package / Version)\n\n")
       print(utils::head(as.data.frame(pkgs), 50))
     }
+    sink()
     catf("SESSION escrito en: %s", sess_path)
   }
   
   invisible(mf_path)
+}
+
+
+# ============================ PROGRESS HELPERS ============================
+.progress <- new.env(parent = emptyenv())
+
+progress_init <- function(total_steps) {
+  .progress$done  <- 0L
+  .progress$total <- max(1L, as.integer(total_steps))
+  .progress$pb    <- utils::txtProgressBar(min = 0, max = 100, style = 3)
+  utils::setTxtProgressBar(.progress$pb, 0)
+}
+
+progress_step <- function(label = NULL, inc = 1L) {
+  .progress$done <- min(.progress$done + as.integer(inc), .progress$total)
+  pct <- round(100 * .progress$done / .progress$total)
+  if (!is.null(.progress$pb)) utils::setTxtProgressBar(.progress$pb, pct)
+  if (!is.null(label)) catf("Progreso %3d%% | %s", pct, label)
+}
+
+progress_finalize <- function() {
+  if (!is.null(.progress$pb)) {
+    utils::setTxtProgressBar(.progress$pb, 100)
+    close(.progress$pb); .progress$pb <- NULL
+  }
+  catf("Progreso 100%% | DONE")
 }
 
 # ============================ RNG & FAMILIAS =============================
@@ -712,11 +739,14 @@ prep_scenarios <- function(dist_name, dist_param_grid,
       for (r in seq_len(num_samples)) {
         # Muestra base
         if (!is.null(sim_seeds)) {
-          s <- .seed_scope(sim_seeds[r], base::sample(combined_population, n))
+          replace_flag <- length(combined_population) < n
+          s <- .seed_scope(sim_seeds[r],
+                           base::sample(combined_population, n, replace = replace_flag))
         } else {
           replace_flag <- length(combined_population) < n
           s <- base::sample(combined_population, n, replace = replace_flag)
         }
+        
         # Contaminación si aplica
         if (isTRUE(sc$contamination_rate > 0)) {
           s <- inject_outliers_realistic(
@@ -1222,6 +1252,8 @@ summarize_scenario <- function(S, weights, distribution, sample_size,
   )
 }
 
+
+
 # =========================== GA (single split) ===========================
 
 evolve_universal_estimator_per_family <- function(dist_name,
@@ -1687,7 +1719,6 @@ save_family_config_outputs <- function(root_out, family_tag, config_tag, res_cv)
   invisible(TRUE)
 }
 
-
 # ====================== LAUNCHER: TODO EN UNA TIRADA ======================
 
 run_all_one_shot <- function(
@@ -1758,6 +1789,9 @@ run_all_one_shot <- function(
   run_id  <- paste0("GA_UNIFIED_", RUN_TS())
   root_out <- file.path(out_root, run_id); mkdirp(root_out)
   
+  # === NEW: acumulador para la mega-CSV ===
+  biglog <- list()
+  
   # --- MANIFEST enriquecido ---
   search_strategy <- match.arg(search_strategy)
   winner_metric   <- match.arg(winner_metric)
@@ -1803,8 +1837,8 @@ run_all_one_shot <- function(
   )
   write_manifest(root_out, meta)
   # === Enforce mínimos de 40 gens para Fase 1 y Fase 2 ===
-  hp1_gens <- max(30L, as.integer(hp1_gens))
-  hp2_gens <- max(30L, as.integer(hp2_gens))
+  hp1_gens <- max(40L, as.integer(hp1_gens))
+  hp2_gens <- max(40L, as.integer(hp2_gens))
   
   # ---- CRN ----
   crn_env <- make_crn_indices(
@@ -1827,6 +1861,32 @@ run_all_one_shot <- function(
     lambda_instab      = lambda_instab_default,
     stringsAsFactors   = FALSE
   )
+  
+  # ---- Planificador de pasos para mostrar 1-100% --------------------------
+  .plan_family_steps <- function(n_cfg) {
+    if (search_strategy != "halving") return(n_cfg)  # 1 eval por config
+    # F1/F2 si hp_strict
+    n1 <- if (isTRUE(hp_strict)) {
+      if (!is.null(hp1_k)) min(hp1_k, n_cfg) else ceiling(n_cfg * hp1_frac)
+    } else 0L
+    n2 <- if (isTRUE(hp_strict)) {
+      if (!is.null(hp2_k)) min(hp2_k, n1) else ceiling(n1 * 0.33)
+    } else n_cfg
+    start_halv <- if (isTRUE(hp_strict)) min(hp3_pool_k, n2) else n2
+    S <- length(stage_gens_frac)
+    # Suma evaluaciones de cada stage de halving
+    cur <- start_halv
+    n_halv <- 0L
+    for (s in seq_len(S)) {
+      n_halv <- n_halv + max(0L, cur)
+      cur <- if (s < S) max(1L, ceiling(cur / eta)) else finalists_per_family
+    }
+    n_final <- finalists_per_family
+    n1 + n2 + n_halv + n_final
+  }
+  
+  total_steps <- sum(vapply(families_to_run, function(fam) .plan_family_steps(nrow(cfg_grid)), integer(1)))
+  progress_init(total_steps)
   
   # ======== util interno: score de etapa (q95 val con fallback) =========
   .stage_score <- function(res_cv) {
@@ -1853,7 +1913,7 @@ run_all_one_shot <- function(
   }
   
   # ======== Acumuladores =================================================
-  big_rows <- list()   # ONE_BIG_ROLLUP
+  big_rows <- list()   # para incluir el rollup dentro de la mega-CSV
   winners_df <- NULL
   
   # ============================== LOOP FAMILIAS ==========================
@@ -1906,12 +1966,24 @@ run_all_one_shot <- function(
             force_scenario_mode  = NULL
           ))
         )
+        progress_step(sprintf("ORIGINAL %s | %s", dist, config_tag))
+        
+        # === NEW: log a la mega-CSV con contexto de fase/budget/cobertura ===
+        ov <- res_cv$final$overall
+        ctx <- list(
+          phase = "ORIGINAL", grind_stage = NA_integer_,
+          budget_gens = generations_per_fold, budget_pop = cfg$pop_size,
+          used_num_samples = num_samples, used_bootstrapB = bootstrap_B,
+          objective = objective,
+          scenario_mode = ov$scenario_mode[1],
+          coverage_hint = ifelse(tolower(ov$scenario_mode[1]) == "full", "full", "partial")
+        )
+        biglog <- .collect_from_cv(biglog, res_cv, run_id, dist, config_tag, is_winner = FALSE, context = ctx)
         
         if (!isTRUE(suppress_intermediate_saves)) {
           try(save_family_config_outputs(root_out, dist, config_tag, res_cv), silent = TRUE)
         }
         
-        ov <- res_cv$final$overall
         row <- data.frame(
           family          = dist,
           config_tag      = config_tag,
@@ -1932,6 +2004,7 @@ run_all_one_shot <- function(
           delta_max_mse   = NA_real_,
           stringsAsFactors = FALSE
         )
+        
         big_rows[[length(big_rows)+1L]] <- row
       }
       
@@ -1995,9 +2068,20 @@ run_all_one_shot <- function(
               force_scenario_mode  = NULL
             ))
           )
+          progress_step(sprintf("HPF1 %s | %s", dist, tag))
+          # === NEW: log de F1 ===
+          ov <- res1$final$overall
+          ctx <- list(
+            phase = "HPF1", grind_stage = 1L,
+            budget_gens = hp1_gens, budget_pop = cfg$pop_size,
+            used_num_samples = hp1_ns, used_bootstrapB = hp1_B,
+            objective = objective,
+            scenario_mode = ov$scenario_mode[1],
+            coverage_hint = ifelse(tolower(ov$scenario_mode[1]) == "full", "full", "partial")
+          )
+          biglog <- .collect_from_cv(biglog, res1, run_id, dist, tag, is_winner = FALSE, context = ctx)
           
           sc <- .stage_score(res1)
-          ov <- res1$final$overall
           phase1_rows[[i]] <- data.frame(
             family          = dist,
             config_tag      = tag,
@@ -2014,8 +2098,13 @@ run_all_one_shot <- function(
             robust_mean_mse_stage = ov$robust_mean_mse[1],
             robust_q95_mse_stage  = ov$robust_q95_mse[1],
             robust_max_mse_stage  = ov$robust_max_mse[1],
+            # === NUEVO: también guarda “finales” en parciales ===
+            robust_mean_mse_final = ov$robust_mean_mse[1],
+            robust_q95_mse_final  = ov$robust_q95_mse[1],
+            robust_max_mse_final  = ov$robust_max_mse[1],
             stringsAsFactors = FALSE
           )
+          
         }
         big_rows <- c(big_rows, phase1_rows)
         
@@ -2076,9 +2165,20 @@ run_all_one_shot <- function(
               force_scenario_mode  = NULL
             ))
           )
+          progress_step(sprintf("HPF2 %s | %s", dist, tag))
+          # === NEW: log de F2 ===
+          ov <- res2$final$overall
+          ctx <- list(
+            phase = "HPF2", grind_stage = 2L,
+            budget_gens = hp2_gens, budget_pop = cfg$pop_size,
+            used_num_samples = hp2_ns, used_bootstrapB = hp2_B,
+            objective = objective,
+            scenario_mode = ov$scenario_mode[1],
+            coverage_hint = ifelse(tolower(ov$scenario_mode[1]) == "full", "full", "partial")
+          )
+          biglog <- .collect_from_cv(biglog, res2, run_id, dist, tag, is_winner = FALSE, context = ctx)
           
           sc <- .stage_score(res2)
-          ov <- res2$final$overall
           phase2_rows[[i]] <- data.frame(
             family          = dist,
             config_tag      = tag,
@@ -2095,8 +2195,13 @@ run_all_one_shot <- function(
             robust_mean_mse_stage = ov$robust_mean_mse[1],
             robust_q95_mse_stage  = ov$robust_q95_mse[1],
             robust_max_mse_stage  = ov$robust_max_mse[1],
+            # === NUEVO: “finales” en parciales ===
+            robust_mean_mse_final = ov$robust_mean_mse[1],
+            robust_q95_mse_final  = ov$robust_q95_mse[1],
+            robust_max_mse_final  = ov$robust_max_mse[1],
             stringsAsFactors = FALSE
           )
+          
         }
         big_rows <- c(big_rows, phase2_rows)
         
@@ -2162,15 +2267,25 @@ run_all_one_shot <- function(
               force_scenario_mode  = "full"
             ))
           )
-          
+          progress_step(sprintf("HALVING S%d %s | %s", s, dist, config_tag))
           if (!isTRUE(suppress_intermediate_saves)) {
             ov_tmp <- res_cv$final$overall
             .write_csv_safe(ov_tmp, file.path(root_out, dist,
                                               sprintf("STAGE%d__%s__OVERALL.csv", s, config_tag)))
           }
           
-          score <- .stage_score(res_cv)
+          # === NEW: log de HALVING (siempre full) ===
           ov <- res_cv$final$overall
+          ctx <- list(
+            phase = "HALVING", grind_stage = as.integer(s),
+            budget_gens = gens_s, budget_pop = pop_s,
+            used_num_samples = num_s, used_bootstrapB = B_s,
+            objective = objective,
+            scenario_mode = "full", coverage_hint = "full"
+          )
+          biglog <- .collect_from_cv(biglog, res_cv, run_id, dist, config_tag, is_winner = FALSE, context = ctx)
+          
+          score <- .stage_score(res_cv)
           row <- data.frame(
             family          = dist,
             config_tag      = config_tag,
@@ -2187,8 +2302,14 @@ run_all_one_shot <- function(
             robust_mean_mse_stage = ov$robust_mean_mse[1],
             robust_q95_mse_stage  = ov$robust_q95_mse[1],
             robust_max_mse_stage  = ov$robust_max_mse[1],
+            # === NUEVO: “finales” en parciales ===
+            robust_mean_mse_final = ov$robust_mean_mse[1],
+            robust_q95_mse_final  = ov$robust_q95_mse[1],
+            robust_max_mse_final  = ov$robust_max_mse[1],
             stringsAsFactors = FALSE
           )
+          
+          
           big_rows[[length(big_rows)+1L]] <- row
           stage_eval[[i]] <- list(score=score, cfg=cfg)
         }
@@ -2244,12 +2365,21 @@ run_all_one_shot <- function(
             force_scenario_mode  = "full"
           ))
         )
+        progress_step(sprintf("FINAL %s | %s", dist, config_tag))
+        # === NEW: log del FINAL (full) ===
+        ov_f <- res_final$final$overall
+        ctx <- list(
+          phase = "FINAL", grind_stage = length(stage_gens_frac),
+          budget_gens = generations_per_fold, budget_pop = max(pop_sizes),
+          used_num_samples = num_samples, used_bootstrapB = bootstrap_B,
+          objective = objective,
+          scenario_mode = "full", coverage_hint = "full"
+        )
+        biglog <- .collect_from_cv(biglog, res_final, run_id, dist, config_tag, is_winner = FALSE, context = ctx)
         
         if (!isTRUE(suppress_intermediate_saves)) {
           try(save_family_config_outputs(root_out, dist, config_tag, res_final), silent = TRUE)
         }
-        
-        ov_f <- res_final$final$overall
         
         # Buscar fila de última etapa (para deltas, best-effort por seed)
         S_last <- length(stage_gens_frac)
@@ -2287,86 +2417,228 @@ run_all_one_shot <- function(
           delta_max_mse   = delta_max,
           stringsAsFactors = FALSE
         )
+        
         big_rows[[length(big_rows)+1L]] <- row_final
       }
     } # end halving path
   } # end families loop
   
-  # ======== ONE BIG CSV (unificado) ========
-  if (length(big_rows) == 0L) {
-    warning("No se generaron filas en big_rows; no hay resultados para escribir.")
-    return(invisible(list(out_dir = root_out, one_big = NULL)))
+  # ======== INCRUSTAR ROLLUP Y (OPCIONAL) WINNERS EN LA MEGA-CSV =========
+  one_big <- NULL
+  if (length(big_rows) > 0L) {
+    one_big <- dplyr::bind_rows(big_rows)
+    # Mete el rollup como bloque en la mega-CSV
+    biglog <- .add_block(biglog, one_big, "one_big_rollup",
+                         run_id, family = "__mixed__", config_tag = "__rollup__",
+                         is_winner = FALSE, fold = NA_integer_)
   }
-  one_big <- dplyr::bind_rows(big_rows)
-  one_big$coverage_hint <- ifelse(one_big$is_finalist, "full", "partial")
-  mkdirp(root_out)
-  readr::write_csv(one_big, file.path(root_out, "ONE_BIG_ROLLUP.csv"))
   
-  # ======== Selección de ganadores por familia (opcional) ========
-  if (isTRUE(pick_single_winner_per_family)) {
+  if (isTRUE(pick_single_winner_per_family) && !is.null(one_big) && nrow(one_big) > 0) {
     cand <- one_big[one_big$is_finalist %in% TRUE, , drop = FALSE]
     if (nrow(cand) > 0) {
       metric_col <- switch(winner_metric,
                            robust_q95_mse  = "robust_q95_mse_final",
                            robust_mean_mse = "robust_mean_mse_final",
                            robust_max_mse  = "robust_max_mse_final")
-      if (!metric_col %in% names(cand)) {
-        warning(sprintf("Columna de métrica '%s' no encontrada. No se generará FAMILY_WINNERS.csv.", metric_col))
-      } else {
+      if (metric_col %in% names(cand)) {
         winners_df <- cand %>%
           dplyr::group_by(family) %>%
           dplyr::filter(.data[[metric_col]] == min(.data[[metric_col]], na.rm = TRUE)) %>%
           dplyr::slice(1) %>%
           dplyr::ungroup()
-        .write_csv_safe(winners_df, file.path(root_out, "FAMILY_WINNERS.csv"))
+        # Incrusta winners como bloque especial
+        biglog <- .add_block(biglog, winners_df, "family_winners",
+                             run_id, family = "__mixed__", config_tag = "__winners__",
+                             is_winner = TRUE, fold = NA_integer_)
+      } else {
+        warning(sprintf("Columna de métrica '%s' no encontrada para winners.", metric_col))
       }
     }
   }
   
-  write_manifest(root_out, meta, extra = utils::head(one_big, 10))
-  message(sprintf(
-    "\nLISTO. Artefactos en: %s\n- ONE CSV: %s%s",
-    root_out,
-    file.path(root_out, "ONE_BIG_ROLLUP.csv"),
-    if (!is.null(winners_df)) sprintf("\n- FAMILY WINNERS: %s", file.path(root_out, "FAMILY_WINNERS.csv")) else ""
-  ))
+  # ======================= UNA SOLA MEGA-CSV =============================
+  if (length(biglog) == 0L) {
+    progress_finalize()  # <- cierra barra también en salida temprana
+    warning("No se recolectaron bloques; no hay datos para ALL_IN_ONE.csv")
+    return(invisible(list(out_dir = root_out, all_in_one = NULL)))
+  }
   
-  invisible(list(out_dir = root_out, one_big = one_big, winners = winners_df))
+  
+  all_in_one <- dplyr::bind_rows(biglog)
+  # Parsea hiperparámetros desde .config_tag (si no existían como columnas)
+  cfg_parsed <- dplyr::bind_rows(lapply(all_in_one$.config_tag, function(ct) {
+    if (is.null(ct) || is.na(ct)) return(data.frame(ps=NA,mr=NA,a0=NA,am=NA,im=NA,t=NA,e=NA,seed=NA,stage=NA))
+    .parse_config(ct)
+  }))
+  all_in_one <- dplyr::bind_cols(all_in_one, cfg_parsed)
+  
+  # Orden de columnas: primero trazabilidad
+  front_cols <- c(".table",".run_id",".family",".config_tag",".is_winner",".fold",
+                  "phase","grind_stage","coverage_hint",
+                  "budget_gens","budget_pop","used_num_samples","used_bootstrapB",
+                  "objective","scenario_mode",
+                  "ps","mr","a0","am","im","t","e","seed","stage")
+  rest_cols  <- setdiff(names(all_in_one), front_cols)
+  all_in_one <- all_in_one[, c(intersect(front_cols, names(all_in_one)), rest_cols)]
+  
+  mkdirp(root_out)
+  readr::write_csv(all_in_one, file.path(root_out, "ALL_IN_ONE.csv"))
+  gz <- gzfile(file.path(root_out, "ALL_IN_ONE.csv.gz"), "wt")
+  on.exit(close(gz), add = TRUE)
+  readr::write_csv(all_in_one, gz)
+  
+  write_manifest(root_out, meta, extra = utils::head(all_in_one, 10))
+  message(sprintf(
+    "\nLISTO. Artefactos en: %s\n- ONE MEGA-CSV: %s (y .gz)\n",
+    root_out,
+    file.path(root_out, "ALL_IN_ONE.csv")
+  ))
+  progress_finalize()
+  invisible(list(out_dir = root_out, all_in_one = all_in_one, winners = winners_df))
 }
 
 
 
 # -------- BIG LOG HELPERS (unified CSV) ---------------------------------
 # (Se mantienen por compatibilidad. Úsalos si quieres un log detallado por tabla.)
+
+# --- Internos: utilidades pequeñas para estampar contexto y columnas ----
+
+.safe_cbind <- function(df, extra) {
+  if (is.null(extra) || length(extra) == 0) return(df)
+  ex <- as.data.frame(extra, stringsAsFactors = FALSE, check.names = FALSE)
+  if (nrow(df) > 0 && nrow(ex) %in% c(0,1)) {
+    # Recicla fila única de contexto a nrow(df)
+    ex <- ex[rep(1, nrow(df)), , drop = FALSE]
+    rownames(ex) <- NULL
+  }
+  cbind(df, ex, stringsAsFactors = FALSE)
+}
+
+# Parser de hiperparámetros desde config_tag (para trazabilidad completa)
+.parse_config <- function(config_tag) {
+  # Ejemplos de tags:
+  # "ps80_mr0.18_a00.50_am1.00_im0.10_t2_e1_seed101"
+  # "ps60_mr0.12_a01.00_am0.50_im0.05_t3_e2_seed202_STAGE2"
+  as_num <- function(x) suppressWarnings(as.numeric(x))
+  data.frame(
+    ps    = as_num(sub(".*\\bps(\\d+).*", "\\1", config_tag)),
+    mr    = as_num(sub(".*_mr([0-9.]+).*", "\\1", config_tag)),
+    a0    = as_num(sub(".*_a0([0-9.]+).*", "\\1", config_tag)),
+    am    = as_num(sub(".*_am([0-9.]+).*", "\\1", config_tag)),
+    im    = as_num(sub(".*_im([0-9.]+).*", "\\1", config_tag)),
+    t     = as_num(sub(".*_t(\\d+).*", "\\1", config_tag)),
+    e     = as_num(sub(".*_e(\\d+).*", "\\1", config_tag)),
+    seed  = as_num(sub(".*_seed(\\d+).*", "\\1", config_tag)),
+    stage = as_num(sub(".*_STAGE(\\d+)$", "\\1", config_tag)),
+    stringsAsFactors = FALSE, check.names = FALSE
+  )
+}
+
+# Asegura que la tabla de escenarios tenga las columnas clave, rellenando con NA si faltan
+.ensure_scenario_cols <- function(df) {
+  need <- c("distribution","sample_size",
+            "contamination_rate","outlier_scale_mad","contamination_type",
+            "true_mean","scenario_mode",
+            "estimator","mse","mse_q95","mse_max","bias","variance","mad","iqr")
+  for (nm in need) if (!nm %in% names(df)) df[[nm]] <- NA
+  df
+}
+
+# Asegura que la tabla de convergencia tenga las columnas clave
+.ensure_convergence_cols <- function(df) {
+  need <- c("gen","best_train","med_train","best_val","med_val")
+  for (nm in need) if (!nm %in% names(df)) df[[nm]] <- NA
+  df
+}
+
+# Construye un contexto enriquecido combinando:
+# - lo que viene en 'context' (presupuestos, cobertura, fase, etc.)
+# - lo que se pueda inferir del propio resultado (objective, scenario_mode) y del tag
+.build_context <- function(df, table, run_id, family, config_tag, is_winner, fold, context) {
+  # Inferencias básicas
+  cfg <- .parse_config(config_tag)
+  # Intento de deducir scenario_mode desde la propia tabla (si existe la col)
+  scenemode_in_df <- df$scenario_mode[1] %||% NA
+  # coverage_hint: por defecto "full" si scenario_mode == "full"; si no, "partial"
+  inferred_cov <- if (!is.na(scenemode_in_df) && is.character(scenemode_in_df)) {
+    ifelse(tolower(scenemode_in_df) == "full", "full", "partial")
+  } else NA_character_
+  base <- list(
+    .table       = table,
+    .run_id      = run_id,
+    .family      = family,
+    .config_tag  = config_tag,
+    .is_winner   = is_winner,
+    .fold        = as.integer(fold),
+    coverage_hint = inferred_cov
+  )
+  # El 'context' que pase el llamador (budget_gens, budget_pop, used_num_samples, used_bootstrapB,
+  # objective, scenario_mode, phase/grind_stage, etc.) sobrescribe inferencias si está presente.
+  c(base, as.list(cfg), context %||% list())
+}
+
 .add_block <- function(biglog, df, table, run_id, family, config_tag,
-                       is_winner = FALSE, fold = NA_integer_) {
+                       is_winner = FALSE, fold = NA_integer_, context = NULL) {
   if (is.null(df) || !is.data.frame(df) || nrow(df) == 0L) return(biglog)
-  df$.table      <- table
-  df$.run_id     <- run_id
-  df$.family     <- family
-  df$.config_tag <- config_tag
-  df$.is_winner  <- is_winner
-  df$.fold       <- as.integer(fold)
+  
+  # Normaliza tablas específicas (garantiza columnas clave para la mega-CSV)
+  if (identical(table, "final_scenarios") || identical(table, "fold_scenarios")) {
+    df <- .ensure_scenario_cols(df)
+  } else if (identical(table, "final_convergence") || identical(table, "fold_convergence")) {
+    df <- .ensure_convergence_cols(df)
+  }
+  
+  # Construye contexto enriquecido e inyéctalo como columnas
+  ctx <- .build_context(df, table, run_id, family, config_tag, is_winner, fold, context)
+  df  <- .safe_cbind(df, ctx)
+  
   biglog[[length(biglog) + 1L]] <- df
   biglog
 }
 
 # Extraer todo de un resultado de CV a filas largas
-.collect_from_cv <- function(biglog, res_cv, run_id, family, config_tag, is_winner = FALSE) {
+# 'context' permite estampar presupuestos/escenario/cobertura/fase:
+#   list(
+#     objective=..., scenario_mode=..., coverage_hint=..., phase="HPF1|HPF2|HALVING|FINAL",
+#     grind_stage=1L, budget_gens=..., budget_pop=..., used_num_samples=..., used_bootstrapB=...
+#   )
+.collect_from_cv <- function(biglog, res_cv, run_id, family, config_tag,
+                             is_winner = FALSE, context = NULL) {
   if (is.null(res_cv) || is.null(res_cv$final)) return(biglog)
-  biglog <- .add_block(biglog, res_cv$final$overall,        "final_overall",        run_id, family, config_tag, is_winner)
-  biglog <- .add_block(biglog, res_cv$final$scenario_table, "final_scenarios",      run_id, family, config_tag, is_winner)
-  biglog <- .add_block(biglog, res_cv$final$convergence,    "final_convergence",    run_id, family, config_tag, is_winner)
+  
+  # Intenta extraer objective/scenario_mode del overall final si no vinieron en 'context'
+  ov <- res_cv$final$overall
+  if (is.data.frame(ov) && nrow(ov)) {
+    context <- modifyList(
+      list(
+        objective    = ov$objective[1] %||% context$objective,
+        scenario_mode= ov$scenario_mode[1] %||% context$scenario_mode
+      ),
+      context %||% list()
+    )
+  }
+  
+  biglog <- .add_block(biglog, res_cv$final$overall,        "final_overall",
+                       run_id, family, config_tag, is_winner, fold = NA_integer_, context = context)
+  biglog <- .add_block(biglog, res_cv$final$scenario_table, "final_scenarios",
+                       run_id, family, config_tag, is_winner, fold = NA_integer_, context = context)
+  biglog <- .add_block(biglog, res_cv$final$convergence,    "final_convergence",
+                       run_id, family, config_tag, is_winner, fold = NA_integer_, context = context)
   
   fr_list <- res_cv$fold_results %||% list()
   for (k in seq_along(fr_list)) {
     fr <- fr_list[[k]]
-    biglog <- .add_block(biglog, fr$overall,        "fold_overall",        run_id, family, config_tag, is_winner, fold = k)
-    biglog <- .add_block(biglog, fr$scenario_table, "fold_scenarios",      run_id, family, config_tag, is_winner, fold = k)
-    biglog <- .add_block(biglog, fr$convergence,    "fold_convergence",    run_id, family, config_tag, is_winner, fold = k)
+    biglog <- .add_block(biglog, fr$overall,        "fold_overall",
+                         run_id, family, config_tag, is_winner, fold = k, context = context)
+    biglog <- .add_block(biglog, fr$scenario_table, "fold_scenarios",
+                         run_id, family, config_tag, is_winner, fold = k, context = context)
+    biglog <- .add_block(biglog, fr$convergence,    "fold_convergence",
+                         run_id, family, config_tag, is_winner, fold = k, context = context)
   }
   biglog
 }
+
 
 
 # # =============================== FINAL RUN ===============================
@@ -2374,7 +2646,7 @@ run_all_one_shot <- function(
 # # Resultados se guardan en "./Final/GA_UNIFIED_<timestamp>"
 # 
 out_final <- run_all_one_shot(
-  families_to_run = c("normal","lognormal"),
+  families_to_run = c("normal"),
 
   # hiperparámetros GA (pool amplio, razonables para full run)
   pop_sizes       = c(80, 100),
