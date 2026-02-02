@@ -1,0 +1,18 @@
+# RUN_ID: GA_UNIFIED_20260130_111817
+timestamp: 2026-01-30 12:16:40.941948
+git: NA
+platform: x86_64-w64-mingw32/x86_64 | R: 4.5.1 | locale: LC_COLLATE=English_United States.utf8;LC_CTYPE=English_United States.utf8;LC_MONETARY=English_United States.utf8;LC_NUMERIC=C;LC_TIME=English_United States.utf8
+
+## CONFIG
+families: normal
+k_folds: 2
+objective: mixed
+seeds: 101
+pop_sizes: 20
+generations_per_fold: 8
+final_retrain: FALSE
+bootstrap_B: 30
+lambda_instab (default): 0.15
+scenario_mode: both
+minibatch_frac: 0.5
+minibatch_min: 8

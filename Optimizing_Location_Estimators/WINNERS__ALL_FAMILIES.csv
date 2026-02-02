@@ -1,0 +1,2 @@
+family,seed,cfg_tag,winner_k,winner_estimator_str,winner_robust_q95_mse,winner_robust_mean_mse,winner_robust_max_mse
+normal,101,FINAL__ps20_mr0.15_a0.70_am0.70_im0.08_t2_e1_li0.15_seed101,1,0*mean + 0*median + 0*trimmed20 + 0.5*harmonic + 0.5*geometric + 0*mode_hsm + 0*mode_parzen + 0*trimean + 0*huber + 0*biweight,1.4182805365746165,0.7942893150443596,1.4295881726250563
