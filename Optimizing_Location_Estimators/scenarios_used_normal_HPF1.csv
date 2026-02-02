@@ -1,0 +1,9 @@
+contamination_rate,outlier_scale_mad,contamination_type,scenario_id
+0.02,3,upper_tail,SC00002
+0,9,upper_tail,SC00004
+0.02,20,upper_tail,SC00008
+0,20,symmetric_t,SC00016
+0.02,20,symmetric_t,SC00017
+0.2,9,clustered_symmetric,SC00024
+0.02,20,clustered_symmetric,SC00026
+0,3,mixture_bimodal_near,SC00028

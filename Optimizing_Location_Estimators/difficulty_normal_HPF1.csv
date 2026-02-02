@@ -1,0 +1,2 @@
+n_scenarios,rate_mean,rate_q95,scale_mean,scale_q95,severity_mean,severity_q95,entropy_type,entropy_groups
+8,0.035,0.1369999999999999,13,20,0.3825,1.3099999999999992,1.3208883431493221,2.0794415416798357
